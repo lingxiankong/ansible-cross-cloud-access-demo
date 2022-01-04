@@ -1,0 +1,40 @@
+---
+- name: Resource clean up
+  hosts: 127.0.0.1
+  connection: local
+  gather_facts: false
+
+  vars:
+    resource_prefix: lingxian
+
+    gcp_region: "australia-southeast1"
+    gcp_zone: "australia-southeast1-c"
+    keep_resource: false
+
+    aws_role: "{{ resource_prefix }}-for-gcp"
+
+  tasks:
+    - name: Delete AWS role policy file
+      file:
+        path: aws_role_policy.json
+        state: absent
+
+    - name: Delete GCP resources
+      when: not keep_resource
+      block:
+        - name: Delete GCP VM
+          google.cloud.gcp_compute_instance:
+            state: absent
+            name: "{{ resource_prefix }}-vm"
+            zone: "{{ gcp_zone }}"
+
+        - name: Delete GCP IP address
+          google.cloud.gcp_compute_address:
+            state: absent
+            name: "{{ resource_prefix }}-ip"
+            region: "{{ gcp_region }}"
+
+    - name: Delete AWS role
+      community.aws.iam_role:
+        name: "{{ aws_role }}"
+        state: absent

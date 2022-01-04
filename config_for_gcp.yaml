@@ -1,0 +1,108 @@
+---
+- name: Config GCP workloads to access AWS resources
+  hosts: 127.0.0.1
+  connection: local
+  gather_facts: false
+
+  vars:
+    resource_prefix: lingxian
+    ssh_public_key: /Users/konglingxian/.ssh/id_rsa.pub
+    ssh_private_key: /Users/konglingxian/.ssh/id_rsa
+    tag:
+      created_by: lingxian
+
+    gcp_existing_vm: ""
+    gcp_vm_user: "ubuntu"
+    gcp_region: "australia-southeast1"
+    gcp_zone: "australia-southeast1-c"
+    gcp_sa_email: ""
+    gcp_sa_id: ""
+
+    aws_role: "{{ resource_prefix }}-for-gcp"
+    aws_role_managed_policies:
+      - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+
+  tasks:
+    - name: Create GCP VM resources
+      when: gcp_existing_vm == ""
+      block:
+        - name: Create GCP disk
+          google.cloud.gcp_compute_disk:
+            name: "{{ resource_prefix }}-disk"
+            size_gb: 10
+            source_image: 'projects/ubuntu-os-cloud/global/images/family/ubuntu-2004-lts'
+            zone: "{{ gcp_zone }}"
+          register: disk
+
+        - name: Create GCP IP address
+          google.cloud.gcp_compute_address:
+            name: "{{ resource_prefix }}-ip"
+            region: "{{ gcp_region }}"
+          register: address
+
+        - name: Create GCP VM
+          google.cloud.gcp_compute_instance:
+            state: present
+            name: "{{ resource_prefix }}-vm"
+            machine_type: n1-standard-1
+            disks:
+              - auto_delete: true
+                boot: true
+                source: "{{ disk }}"
+            network_interfaces:
+              - network: null # use default
+                access_configs:
+                  - name: 'External NAT'
+                    nat_ip: "{{ address }}"
+                    type: 'ONE_TO_ONE_NAT'
+            metadata:
+              ssh-keys: "{{ gcp_vm_user }}:{{ lookup('file', '{{ ssh_public_key }}') }}"
+            service_accounts:
+              - email: "{{ gcp_sa_email }}"
+            labels: "{{ tag }}"
+            zone: "{{ gcp_zone }}"
+
+    - name: Create AWS role policy file
+      template:
+        src: templates/aws_role_policy.json.j2
+        dest: aws_role_policy.json
+      delegate_to: localhost
+
+    - name: Create AWS role for GCP workloads
+      community.aws.iam_role:
+        name: "{{ aws_role }}"
+        assume_role_policy_document: "{{ lookup('file','aws_role_policy.json') }}"
+        managed_policies: "{{ aws_role_managed_policies }}"
+        tags: "{{ tag }}"
+        create_instance_profile: false
+      register: aws_role_ret
+
+    - name: Wait for new GCP VM SSH ready
+      wait_for: port=22 host="{{ address.address }}" search_regex=OpenSSH timeout=300 delay=5
+      when: gcp_existing_vm == ""
+
+    - name: Get GCP VM facts
+      google.cloud.gcp_compute_instance_info:
+        zone: "{{ gcp_zone }}"
+        filters:
+          - name = {{ gcp_existing_vm if gcp_existing_vm != "" else resource_prefix + "-vm" }}
+      register: gcp_vm_ret
+
+    - name: Add GCP VM to inventory
+      add_host:
+        hostname: "{{ gcp_vm_ret.resources[0].networkInterfaces[0].accessConfigs[0].natIP }}"
+        groups: gcp_vms
+        ansible_user: "{{ gcp_vm_user }}"
+        ansible_host: "{{ gcp_vm_ret.resources[0].networkInterfaces[0].accessConfigs[0].natIP }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+        ansible_ssh_private_key_file: "{{ ssh_private_key }}"
+        aws_role_arn: "{{ aws_role_ret.iam_role.arn }}"
+
+- name: Config AWS resource access in GCP VMs
+  hosts: gcp_vms
+  become: true
+  become_method: sudo
+  gather_facts: true
+
+  roles:
+    - { role: config_aws_cred }

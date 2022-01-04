@@ -1,0 +1,10 @@
+{
+    "Version": "2012-10-17",
+    "Statement": {
+        "Sid": "RoleForGoogle",
+        "Effect": "Allow",
+        "Principal": {"Federated": "accounts.google.com"},
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {"StringEquals": {"accounts.google.com:aud": "{{ gcp_sa_id }}"}}
+    }
+}

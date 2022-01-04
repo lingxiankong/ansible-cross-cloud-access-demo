@@ -1,0 +1,50 @@
+- name: Wait for cloud init to finish
+  raw: cloud-init status --wait
+
+- name: Install packages
+  apt:
+    name: "{{ packages }}"
+    state: present
+    update_cache: yes
+  vars:
+    packages:
+      - python3-pip
+      - jq
+      - unzip
+
+- name: Install pypi libraries
+  pip:
+    name: "{{ libraries }}"
+  vars:
+    libraries:
+      - boto3
+
+- name: Install AWS CLI
+  shell:
+    executable: /bin/bash
+    chdir: "{{ ansible_user_dir }}"
+    cmd: |
+      _=$(command -v aws)
+      if [ $? -ne 0 ]; then
+          curl -SL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o {{ ansible_user_dir }}/awscliv2.zip
+          unzip -qq awscliv2.zip
+          ./aws/install
+      fi
+
+- name: Download get_aws_cred_in_gcp.py file
+  get_url:
+    url: https://gist.github.com/lingxiankong/291f99f416caf1c1d40a748ecc7aa6c4/raw
+    dest: /usr/local/bin/get_aws_cred
+    mode: 0755
+    force: no
+
+- name: Create AWS user directory
+  file:
+    path: "{{ user_home }}/.aws"
+    state: directory
+    owner: "{{ user }}"
+
+- name: Create AWS credentials file
+  template:
+    src: aws_credentials.j2
+    dest: "{{ user_home }}/.aws/credentials"

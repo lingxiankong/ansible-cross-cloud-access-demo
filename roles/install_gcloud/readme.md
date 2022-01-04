@@ -1,0 +1,1 @@
+* This role is supposed to be running inside an Ubuntu VM.

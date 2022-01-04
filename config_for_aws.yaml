@@ -1,0 +1,157 @@
+---
+- name: Config AWS workloads to access GCP resources
+  hosts: 127.0.0.1
+  connection: local
+  gather_facts: false
+
+  vars:
+    resource_prefix: lingxian
+    ssh_private_key: /Users/konglingxian/.ssh/id_rsa
+    tag:
+      created_by: lingxian
+
+    aws_account: ""
+    aws_vm_id: ""
+    aws_role: "{{ resource_prefix }}-for-gcp"
+
+    aws_vm_type: t2.micro
+    aws_keypair: xxx
+    aws_image: ami-0b7dcd6e6fd797935
+    aws_security_group: sg-0dfb220849422444f
+    aws_subnet: subnet-0bf0e9cd9a3d84282
+
+    gcp_project: ""
+    gcp_project_number: ""
+    gcp_sa_name: "{{ resource_prefix }}-for-aws"
+    gcp_sa_project_roles:
+      - roles/owner
+    gcp_aws_pool: aws-pool
+    gcp_aws_provider: aws-provider
+    gcp_for_aws_cred_file: gcp-for-aws.json
+
+  tasks:
+    - name: Create an empty AWS role
+      community.aws.iam_role:
+        name: "{{ aws_role }}"
+        assume_role_policy_document: "{{ lookup('file','files/empty_role_policy.json') }}"
+        tags: "{{ tag }}"
+        create_instance_profile: true
+      when: aws_vm_id == ""
+
+    - name: Create AWS VM
+      amazon.aws.ec2_instance:
+        name: '{{ resource_prefix }}-vm'
+        state: present
+        instance_role: "{{ aws_role }}"
+        instance_type: "{{ aws_vm_type }}"
+        key_name: "{{ aws_keypair }}"
+        image_id: "{{ aws_image }}"
+        network:
+          assign_public_ip: true
+        security_group: "{{ aws_security_group }}"
+        vpc_subnet_id: "{{ aws_subnet }}"
+        tags: "{{ tag }}"
+      register: ec2
+      when: aws_vm_id == ""
+
+    - name: Create GCP service account
+      google.cloud.gcp_iam_service_account:
+        name: "{{ gcp_sa_name }}@{{ gcp_project }}.iam.gserviceaccount.com"
+        display_name: "Service account for AWS workloads"
+        project: "{{ gcp_project }}"
+        state: present
+      register: gcp_sa
+
+    - name: Create GCP identity pool and provider
+      shell:
+        executable: /bin/bash
+        cmd: |
+          set -ex
+
+          pool_id={{ gcp_aws_pool }}
+          ret=$(gcloud iam workload-identity-pools list --location="global" --format json | jq -r --arg pool_id "$pool_id" '[.[] | select(.name | endswith($pool_id))] | length')
+          if [[ $ret == 0 ]]; then
+            echo "Creating workload identity pool and provider..."
+            gcloud iam workload-identity-pools create {{ gcp_aws_pool }} \
+                --location="global" \
+                --description="AWS Identity Pool" \
+                --display-name="AWS Identity Pool"
+            gcloud iam workload-identity-pools providers create-aws {{ gcp_aws_provider }} \
+              --location="global"  \
+              --workload-identity-pool={{ gcp_aws_pool }} \
+              --account-id={{ aws_account }}
+          else
+            echo "Workload identity pool already exists."
+          fi
+
+    - name: Add policy bindings for GCP service account
+      shell:
+        executable: /bin/bash
+        cmd: |
+          set -ex
+          roles={{ gcp_sa_project_roles | join(" ") }}
+          for role in $roles; do
+            gcloud projects add-iam-policy-binding {{ gcp_project }} --member serviceAccount:{{ gcp_sa.email }} --role $role
+          done
+
+          gcloud iam service-accounts add-iam-policy-binding {{ gcp_sa.email }} \
+            --role=roles/iam.workloadIdentityUser \
+            --member="principalSet://iam.googleapis.com/projects/{{ gcp_project_number }}/locations/global/workloadIdentityPools/{{ gcp_aws_pool }}/attribute.aws_role/arn:aws:sts::{{ aws_account }}:assumed-role/{{ aws_role }}"
+
+    - name: Create GCP credentials file
+      shell:
+        executable: /bin/bash
+        cmd: |
+          set -ex
+
+          echo > {{ gcp_for_aws_cred_file }}
+          gcloud iam workload-identity-pools create-cred-config \
+            projects/{{ gcp_project_number }}/locations/global/workloadIdentityPools/{{ gcp_aws_pool }}/providers/{{ gcp_aws_provider }} \
+            --service-account={{ gcp_sa.email }} \
+            --aws \
+            --output-file={{ gcp_for_aws_cred_file }}
+
+    - name: Get new AWS VM facts
+      amazon.aws.ec2_instance_info:
+        instance_ids:
+          - "{{ ec2.instances[0].instance_id }}"
+      register: ec2_facts
+      until: "'public_ip_address' in ec2_facts.instances[0]"
+      retries: 20
+      delay: 3
+      ignore_errors: True
+      when: aws_vm_id == ""
+
+    - name: Get existing AWS VM facts
+      amazon.aws.ec2_instance_info:
+        instance_ids:
+          - "{{ aws_vm_id if aws_vm_id else ec2.instances[0].instance_id }}"
+      register: ec2_facts
+
+    - name: Wait for AWS VM SSH ready
+      wait_for: port=22 host="{{ ec2_facts.instances[0].public_ip_address }}" search_regex=OpenSSH timeout=300 delay=5
+
+    - name: Add AWS VM to inventory
+      add_host:
+        hostname: "{{ ec2_facts.instances[0].public_ip_address }}"
+        groups: aws_vms
+        ansible_user: ubuntu
+        ansible_host: "{{ ec2_facts.instances[0].public_ip_address }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+        ansible_ssh_private_key_file: "{{ ssh_private_key }}"
+
+- name: Config GCP resource access in AWS VM
+  hosts: aws_vms
+  gather_facts: true
+
+  vars:
+    gcp_for_aws_cred_file: gcp-for-aws.json
+
+  pre_tasks:
+    - name: Send GCP credentials file to AWS VM
+      copy:
+        src: "{{ gcp_for_aws_cred_file }}"
+        dest: "{{ ansible_user_dir }}/gcp-for-aws.json"
+
+  roles:
+    - { role: install_gcloud, become: true }
